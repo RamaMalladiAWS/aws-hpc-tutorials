@@ -50,14 +50,14 @@ The cluster configuration that you generate for Amazon FSx for Lustre includes t
 
 - Scratch Lustre partition of 1.2 TB; using the Amazon S3 bucket created previously as the import and export path.
   - There are two primary deployment options for Lustre, scratch or persistent. Scratch is best for temporary storage and shorter-term processing of data. There are two deployment options for Scratch, SCRATCH_1 and SCRATCH_2. SCRATCH_1 is the default deployment type. SCRATCH_2 is the latest generation scratch filesystem, and offers higher burst throughput over baseline throughput and also in-transit encryption of data.
-- Set head node and compute nodes as [c5 instances](https://aws.amazon.com/ec2/instance-types/c5/). **C5** is the latest generation of compute-optimized instances. The head node has 4 vcpus and 8 GB of memory, perfect for scheduling jobs and compiling code. The compute instances have 72 vcpus and 144 GB of memory, perfect for compute intensive applications.
+- Set head node and compute nodes as [c5 instances](https://aws.amazon.com/ec2/instance-types/c5/). **C5** instances are compute-optimized instances. The head node has 4 vcpus and 8 GB of memory, perfect for scheduling jobs and compiling code. The compute instances have 72 vcpus and 144 GB of memory, perfect for compute intensive applications.
 - A [placement group](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/placement-groups.html#placement-groups-cluster) to maximize the bandwidth between instances and reduce the latency.
 - Set the cluster to 0 compute nodes when starting, the minimum size to 0, and maximum size to 8 instances. The cluster uses [Auto Scaling Groups](https://docs.aws.amazon.com/autoscaling/ec2/userguide/AutoScalingGroup.html) that will grow and shrink between the min and max limits based on the cluster utilization and job queue backlog.
 - A [GP2 Amazon EBS](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/AmazonEBS.html) volume will be attached to the head node then shared through NFS to be mounted by the compute nodes on */shared*. It is generally a good location to store applications or scripts. Keep in mind that the */home* directory is shared on NFS as well.
 - The job scheduler is [SLURM](https://slurm.schedmd.com/overview.html)
 
 {{% notice tip %}}
-For more details about the configuration options, see the [AWS ParallelCluster User Guide](https://docs.aws.amazon.com/parallelcluster/latest/ug/what-is-aws-parallelcluster.html) and the [fsx parameters section](https://docs.aws.amazon.com/parallelcluster/latest/ug/fsx-section.html#fsx-kms-key-id) of the AWS ParallelCluster User Guide.
+For more details about the configuration options, see the [AWS ParallelCluster User Guide](https://docs.aws.amazon.com/parallelcluster/latest/ug/what-is-aws-parallelcluster.html) and the [fsx parameters section](https://docs.aws.amazon.com/parallelcluster/latest/ug/SharedStorage-v3.html#SharedStorage-v3-FsxLustreSettings) of the AWS ParallelCluster User Guide.
 {{% /notice %}}
 
 {{% notice note %}}
@@ -68,8 +68,8 @@ Paste the following commands into your terminal:
 
 ```bash
 # generate a new keypair, remove those lines if you want to use the previous one
-aws ec2 create-key-pair --key-name lab-4-your-key --query KeyMaterial --output text > ~/.ssh/lab-4-key
-chmod 600 ~/.ssh/lab-4-key
+aws ec2 create-key-pair --key-name lab-4-key --query KeyMaterial --output text > lab-4-key.pem
+chmod 600 lab-4-key.pem
 
 # create the cluster configuration
 IFACE=$(curl --silent http://169.254.169.254/latest/meta-data/network/interfaces/macs/)
@@ -78,57 +78,52 @@ VPC_ID=$(curl --silent http://169.254.169.254/latest/meta-data/network/interface
 AZ=$(curl http://169.254.169.254/latest/meta-data/placement/availability-zone)
 REGION=${AZ::-1}
 
+cat > fsx-config << EOF
+Region: ${REGION}
+Image:
+  Os: alinux2
+SharedStorage:
+  - MountDir: /shared
+    Name: default-ebs
+    StorageType: Ebs
 
-mkdir -p ~/.parallelcluster
-cat > ~/.parallelcluster/config << EOF
-[aws]
-aws_region_name = ${REGION}
+  - Name: fsxshared
+    StorageType: FsxLustre
+    MountDir: /lustre
+    FsxLustreSettings:
+      StorageCapacity: 1200
+      ImportPath: s3://mybucket-${BUCKET_POSTFIX}
+      DeploymentType: SCRATCH_2
 
-[global]
-cluster_template = default
-update_check = false
-sanity_check = false
+HeadNode:
+  InstanceType: c5n.large
+  Networking:
+    SubnetId: ${SUBNET_ID}
+  Ssh:
+    KeyName: lab-4-key
 
-[cluster default]
-key_name = lab-4-your-key
-vpc_settings = public
-base_os = alinux2
-ebs_settings = myebs
-fsx_settings = myfsx
-compute_instance_type = c5.18xlarge
-master_instance_type = c5.xlarge
-cluster_type = ondemand
-placement_group = DYNAMIC
-placement = compute
-max_queue_size = 8
-initial_queue_size = 0
-disable_hyperthreading = true
-scheduler = slurm
-
-[vpc public]
-vpc_id = ${VPC_ID}
-master_subnet_id = ${SUBNET_ID}
-
-[ebs myebs]
-shared_dir = /shared
-volume_type = gp2
-volume_size = 20
-
-[fsx myfsx]
-shared_dir = /lustre
-storage_capacity = 1200
-import_path =  s3://mybucket-${BUCKET_POSTFIX}
-deployment_type = SCRATCH_2
-
-[aliases]
-ssh = ssh {CFN_USER}@{MASTER_IP} {ARGS}
+Scheduling:
+  Scheduler: slurm
+  SlurmQueues:
+    - Name: compute
+      ComputeResources:
+        - Name: c5n18xlarge
+          InstanceType: c5n.18xlarge
+          MinCount: 0
+          MaxCount: 8
+          DisableSimultaneousMultithreading: true
+      Networking:
+        SubnetIds:
+          - ${SUBNET_ID}
+        PlacementGroup:
+          Enabled: true
 EOF
 ```
 
 If you want to check the content of your configuration file, use the following command:
 
 ```bash
-cat ~/.parallelcluster/config
+cat fsx-config
 ```
 
 
@@ -139,7 +134,7 @@ Now, you are ready to create a cluster.
 Create the cluster using the following command.
 
 ```bash
-pcluster create my-fsx-cluster
+pcluster create-cluster --cluster-name my-fsx-cluster --cluster-configuration fsx-config
 ```
 This cluster generates additional resources for Amazon FSx for Lustre which will take a few minutes longer to create than the previous AWS ParallelCluster workshop.
 
@@ -148,7 +143,7 @@ This cluster generates additional resources for Amazon FSx for Lustre which will
 Once created, connect to your cluster.
 
 ```bash
-pcluster ssh my-fsx-cluster -i ~/.ssh/lab-4-key
+pcluster ssh ---cluster-name my-fsx-cluster -i lab-4-key.pem
 ```
 
 Next, take a deeper look at the Lustre file system.
